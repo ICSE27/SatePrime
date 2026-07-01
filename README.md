@@ -3,7 +3,7 @@
 ## Evaluated Satellite Applications
 
  - The evaluation suite comprises 10 typical satellite on-orbit applications, labeled app1 to app10, under the `apps/` directory.
- - Each application is accompanied by a Dockerfile tailored for the satellite payload environment, combining its code repository link.
+ - Each application is accompanied by a Dockerfile tailored for the satellite payload environment.
 
     | AppID | Description |
     | ----- | ----------- |
