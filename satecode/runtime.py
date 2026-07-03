@@ -4,7 +4,6 @@ import io
 import json
 import os
 import shutil
-import struct
 import subprocess
 import tarfile
 import tempfile
@@ -12,10 +11,6 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 from satecode.config import default_config, Config
-
-_FRAME_MAGIC = b'SATI'
-_FRAME_FMT   = struct.Struct(">4sHH QQ 8x")
-assert _FRAME_FMT.size == 32
 
 
 def _is_oci(tar: tarfile.TarFile) -> bool:
@@ -378,67 +373,134 @@ def extract_image(image_tar: Path, dest: Path) -> None:
                 _apply_layer_tar(lt, dest)
 
 
-def _build_ordered_tar(rootfs: Path, aux_dir: Optional[Path],
-                       tier_a: List[str], tier_b: List[str],
-                       out_tar: Path) -> int:
-    boundary = 0
+def _emit_symlink(tf: tarfile.TarFile, base: Path, rel: str) -> None:
+    info = tarfile.TarInfo(name=rel)
+    info.type = tarfile.SYMTYPE
+    info.linkname = os.readlink(base / rel)
+    tf.addfile(info)
+
+
+def _emit_dir(tf: tarfile.TarFile, base: Path, rel: str) -> None:
+    info = tarfile.TarInfo(name=rel)
+    info.type = tarfile.DIRTYPE
+    try:
+        info.mode = (base / rel).stat().st_mode & 0o7777
+    except OSError:
+        info.mode = 0o755
+    tf.addfile(info)
+
+
+def _add_ordered(tf: tarfile.TarFile, base: Path, rel: str,
+                 seen: set, sym: set) -> int:
+    rel = rel.strip("/")
+    if not rel or rel in seen:
+        return 0
+    p = base / rel
+    if not (p.exists() or p.is_symlink()):
+        return 0
+
+    parts = Path(rel).parts
+    for i in range(1, len(parts)):
+        dname = "/".join(parts[:i])
+        if dname in seen:
+            if dname in sym:
+                return 0
+            continue
+        dp = base / dname
+        if dp.is_symlink():
+            _emit_symlink(tf, base, dname)
+            seen.add(dname); sym.add(dname)
+            return 0
+        seen.add(dname)
+        _emit_dir(tf, base, dname)
+
+    if p.is_symlink():
+        _emit_symlink(tf, base, rel)
+        seen.add(rel); sym.add(rel)
+        return 0
+    if p.is_dir():
+        seen.add(rel)
+        _emit_dir(tf, base, rel)
+        return 0
+    if p.is_file():
+        tf.add(p, arcname=rel, recursive=False)
+        seen.add(rel)
+        try:
+            return p.stat().st_size
+        except OSError:
+            return 0
+    return 0
+
+
+def _build_ordered_tar(base: Path, tier_a: List[str], tier_b: List[str],
+                       out_tar: Path, aux_dir: Optional[Path] = None) -> int:
+    hot_bytes = 0
+    seen: set = set()
+    sym:  set = set()
     with tarfile.open(out_tar, "w") as tf:
-        def _add(rel: str, base: Path) -> None:
-            p = base / rel
-            if p.is_symlink():
-                info = tarfile.TarInfo(name=rel)
-                info.type = tarfile.SYMTYPE
-                info.linkname = os.readlink(p)
-                tf.addfile(info)
-            elif p.is_file():
-                tf.add(p, arcname=rel)
-
         for rel in tier_a:
-            _add(rel, rootfs)
-
-        boundary = out_tar.stat().st_size if out_tar.exists() else 0
-
+            hot_bytes += _add_ordered(tf, base, rel, seen, sym)
         for rel in tier_b:
-            _add(rel, rootfs)
-
+            _add_ordered(tf, base, rel, seen, sym)
         if aux_dir and aux_dir.exists():
-            prefix = ".aux"
             for fp in sorted(aux_dir.rglob("*")):
                 if fp.is_file():
-                    tf.add(fp, arcname=prefix + "/" + str(fp.relative_to(aux_dir)))
+                    tf.add(fp, arcname=".aux/" + str(fp.relative_to(aux_dir)),
+                           recursive=False)
+    return hot_bytes
 
-    return boundary
+
+def _round_up(n: int, block: int = 4096) -> int:
+    return ((n + block - 1) // block) * block
 
 
-def build_image(image_tar: Path, output: Path,
+def build_image(source: Path, output: Path,
                 tier_a: List[str], tier_b: List[str],
                 aux_dir: Optional[Path] = None,
-                mkfs_bin: str = "mkfs.erofs") -> int:
+                mkfs_bin: str = "mkfs.erofs",
+                sort: str = "none",
+                source_kind: str = "auto",
+                config: Optional[Config] = None) -> dict:
+    cfg = config or default_config
+    if source_kind == "auto":
+        source_kind = "bundle" if Path(source).is_dir() else "image"
+
     with tempfile.TemporaryDirectory(prefix="sec_build_") as _tmp:
-        tmp      = Path(_tmp)
-        rootfs   = tmp / "rootfs"
-        ord_tar  = tmp / "ord.tar"
-        erofs_img = tmp / "fs.img"
+        tmp     = Path(_tmp)
+        ord_tar = tmp / "ord.tar"
 
-        extract_image(image_tar, rootfs)
-        boundary = _build_ordered_tar(rootfs, aux_dir, tier_a, tier_b, ord_tar)
+        if source_kind == "image":
+            base = tmp / "rootfs"
+            extract_image(Path(source), base)
+        else:
+            base = Path(source)
 
-        r = subprocess.run([mkfs_bin, "-T", str(ord_tar), str(erofs_img)],
-                           capture_output=True, text=True)
-        if r.returncode != 0:
-            raise RuntimeError("mkfs.erofs: {}".format(r.stderr.strip()))
-
-        erofs_data = erofs_img.read_bytes()
-        header = _FRAME_FMT.pack(_FRAME_MAGIC, 1, 0, boundary, len(erofs_data))
+        hot_bytes = _build_ordered_tar(base, tier_a, tier_b, ord_tar, aux_dir)
 
         output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_bytes(header + erofs_data)
+        cmd = [mkfs_bin, "--tar=f", "--sort={}".format(sort), str(output), str(ord_tar)]
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode != 0:
+            raise RuntimeError("mkfs.erofs failed: {}\n  cmd: {}".format(
+                r.stderr.strip(), " ".join(cmd)))
 
-    return boundary
-
-
-def read_frame_header(data: bytes) -> Tuple[int, int]:
-    magic, _, _, boundary, size = _FRAME_FMT.unpack(data[:32])
-    if magic != _FRAME_MAGIC:
-        raise ValueError("bad magic")
-    return boundary, size
+    erofs_size = output.stat().st_size
+    boundary   = min(erofs_size, _round_up(hot_bytes) + cfg.boundary_headroom)
+    meta_path  = Path(str(output) + cfg.meta_suffix)
+    meta = {
+        "format":       "erofs",
+        "version":      1,
+        "image":        output.name,
+        "output":       str(output.resolve()),
+        "meta_path":    str(meta_path),
+        "boundary":     boundary,
+        "erofs_size":   erofs_size,
+        "hot_bytes":    hot_bytes,
+        "sha256":       _sha256(output.read_bytes()),
+        "tier_a_count": len(tier_a),
+        "tier_b_count": len(tier_b),
+        "sort":         sort,
+        "source_kind":  source_kind,
+    }
+    meta_path.write_text(json.dumps(meta, indent=2))
+    return meta

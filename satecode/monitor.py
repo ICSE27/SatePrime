@@ -5,9 +5,10 @@ import hashlib
 import os
 import re
 import select
-import signal
 import struct
 import subprocess
+import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -98,24 +99,16 @@ def _bundle_ok(p: Path) -> bool:
         (p / "config.json").exists()
         or (p / "images.tar").exists()
         or bool(list(p.glob("*.img")))
+        or bool(list(p.glob("**/inventory.img")))
     )
 
 
-def _deliver_signal(task_id: str, token_path: str, runtime: str, ns: str) -> None:
-    pid = None
-    try:
-        pid = int(Path(token_path).read_text().strip())
-    except (OSError, ValueError):
-        pass
-    if pid is not None:
-        try:
-            os.kill(pid, signal.SIGUSR1)
-            return
-        except (ProcessLookupError, PermissionError):
-            pass
+def _deliver_signal(task_id: str, token_path: str, runtime: str, ns: str,
+                    sig: str = "SIGUSR1", runc_bin: str = "runc") -> None:
     for cmd in (
-        ["docker", "kill", "-s", "SIGUSR1", task_id],
-        [runtime, "-n", ns, "task", "kill", "--signal", "SIGUSR1", task_id],
+        [runc_bin, "kill", task_id, sig],
+        ["docker", "kill", "-s", sig, task_id],
+        [runtime, "-n", ns, "task", "kill", "--signal", sig, task_id],
     ):
         try:
             if subprocess.run(cmd, capture_output=True, timeout=10).returncode == 0:
@@ -129,8 +122,11 @@ class SnapshotCoordinator:
 
     def __init__(self, task_id: str, output_dir,
                  token_path: str = "/tmp/checkpoint_ready",
-                 runtime: str = "ctr", namespace: str = "default",
-                 ready_timeout: float = 600.0, exec_timeout: float = 120.0):
+                 runtime: str = "runc", namespace: str = "default",
+                 ready_timeout: float = 600.0, exec_timeout: float = 120.0,
+                 resume_signal: str = "SIGUSR1", runc_bin: str = "runc",
+                 work_path: str = "/tmp/criu-work",
+                 checkpoint_args: Optional[List[str]] = None):
         self.task_id       = task_id
         self.output_dir    = Path(output_dir)
         self.token_path    = token_path
@@ -138,45 +134,119 @@ class SnapshotCoordinator:
         self.namespace     = namespace
         self.ready_timeout = ready_timeout
         self.exec_timeout  = exec_timeout
+        self.resume_signal = resume_signal
+        self.runc_bin      = runc_bin
+        self.work_path     = work_path
+        self.checkpoint_args = checkpoint_args or []
 
     def _acquire(self) -> Path:
-        bundle = self.output_dir / "bundle"
-        bundle.mkdir(parents=True, exist_ok=True)
-        cmd = [self.runtime, "-n", self.namespace, "task", "checkpoint",
-               "--checkpoint-path", str(bundle), self.task_id]
+        if self.runtime == "runc":
+            snap = self.output_dir / "snapshot"
+            snap.mkdir(parents=True, exist_ok=True)
+            cmd = [self.runc_bin, "checkpoint", "--image-path", str(snap),
+                   "--work-path", self.work_path] + self.checkpoint_args + [self.task_id]
+            out = snap
+        else:
+            out = self.output_dir / "bundle"
+            out.mkdir(parents=True, exist_ok=True)
+            cmd = [self.runtime, "-n", self.namespace, "task", "checkpoint",
+                   "--checkpoint-path", str(out), self.task_id]
         try:
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=self.exec_timeout)
         except subprocess.TimeoutExpired:
             raise RuntimeError("snapshot timed out after {}s".format(self.exec_timeout))
         if r.returncode != 0:
             raise RuntimeError("snapshot failed: {}".format(r.stderr.strip()))
-        return bundle
+        return out
 
     def run(self, resume: bool = True) -> dict:
         if not _wait_token(self.token_path, self.ready_timeout):
             raise TimeoutError("token not seen after {}s".format(self.ready_timeout))
 
-        bundle = self._acquire()
-        if not _bundle_ok(bundle):
-            raise RuntimeError("incomplete bundle at {}".format(bundle))
+        out = self._acquire()
+        if not _bundle_ok(out):
+            raise RuntimeError("incomplete snapshot at {}".format(out))
 
         result = {
-            "bundle_path": bundle,
-            "digest":      _tree_digest(bundle),
+            "bundle_path": out,
+            "digest":      _tree_digest(out),
             "task_id":     self.task_id,
             "timestamp":   time.time(),
         }
         if resume:
-            _deliver_signal(self.task_id, self.token_path, self.runtime, self.namespace)
+            try:
+                _deliver_signal(self.task_id, self.token_path, self.runtime,
+                                self.namespace, self.resume_signal, self.runc_bin)
+            except RuntimeError:
+                pass
         return result
 
 
-_OPENAT_RE = re.compile(r'^\d+\s+openat\(AT_FDCWD,\s*"([^"]+)",[^)]+\)\s*=\s*(\d+)')
-_OPEN_RE   = re.compile(r'^\d+\s+open\("([^"]+)",[^)]+\)\s*=\s*(\d+)')
+_OPENAT_RE = re.compile(r'^\d+\s+openat\(AT_FDCWD,\s*"([^"]+)",[^)]+\)\s*=\s*(-?\d+)')
+_OPEN_RE   = re.compile(r'^\d+\s+open\("([^"]+)",[^)]+\)\s*=\s*(-?\d+)')
 _EXEC_RE   = re.compile(r'^\d+\s+execve\("([^"]+)"')
+_EVENTS_RE = re.compile(r'^[A-Z_]+(?:,[A-Z_]+)*$')
 
 
-def _parse_access_log(log_path: Path, rootfs: Path) -> List[str]:
+def _rel_to(path: str, base: Path) -> Optional[str]:
+    b = os.path.normpath(str(base))
+    q = os.path.normpath(path)
+    if q == b:
+        return None
+    prefix = b.rstrip("/") + "/"
+    if q.startswith(prefix):
+        return q[len(prefix):]
+    if not path.startswith("/"):
+        rel = path.lstrip("./")
+        return rel or None
+    return None
+
+
+def detect_log_format(log_path: Path) -> str:
+    try:
+        with log_path.open("r", errors="replace") as fh:
+            for _ in range(50):
+                line = fh.readline()
+                if not line:
+                    break
+                s = line.strip()
+                if not s:
+                    continue
+                if "openat(" in s or "open(" in s or "execve(" in s:
+                    return "strace"
+                parts = s.split()
+                if len(parts) >= 3 and parts[0].isdigit() and _EVENTS_RE.match(parts[-1]):
+                    return "inotify"
+    except OSError:
+        return "unknown"
+    return "unknown"
+
+
+def parse_inotify_log(log_path: Path, base: Path) -> List[str]:
+    seen: Dict[str, int] = {}
+    rank = 0
+    try:
+        lines = log_path.read_text(errors="replace").splitlines()
+    except OSError:
+        return []
+    for line in lines:
+        parts = line.split()
+        if len(parts) < 3 or not parts[0].isdigit() or not _EVENTS_RE.match(parts[-1]):
+            continue
+        events = parts[-1]
+        if "ISDIR" in events:
+            continue
+        path = " ".join(parts[1:-1])
+        rel = _rel_to(path, base)
+        if rel is None:
+            continue
+        if rel not in seen:
+            seen[rel] = rank
+            rank += 1
+    return sorted(seen, key=lambda k: seen[k])
+
+
+def parse_strace_log(log_path: Path, base: Path) -> List[str]:
     seen: Dict[str, int] = {}
     rank = 0
     try:
@@ -196,9 +266,8 @@ def _parse_access_log(log_path: Path, rootfs: Path) -> List[str]:
                 path = m.group(1)
         if path is None:
             continue
-        try:
-            rel = str(Path(path).resolve().relative_to(rootfs))
-        except (ValueError, OSError):
+        rel = _rel_to(path, base)
+        if rel is None:
             continue
         if rel not in seen:
             seen[rel] = rank
@@ -206,40 +275,113 @@ def _parse_access_log(log_path: Path, rootfs: Path) -> List[str]:
     return sorted(seen, key=lambda k: seen[k])
 
 
-def _all_files(rootfs: Path) -> List[str]:
+_parse_access_log = parse_strace_log
+
+
+def _all_files(base: Path) -> List[str]:
     out = []
-    for p in sorted(rootfs.rglob("*")):
+    for p in sorted(base.rglob("*")):
         if p.is_file() or p.is_symlink():
-            out.append(str(p.relative_to(rootfs)))
+            out.append(str(p.relative_to(base)))
     return out
+
+
+def _tier(tier_a: List[str], base: Path) -> Tuple[List[str], List[str]]:
+    s = set(tier_a)
+    tier_b = [f for f in _all_files(base) if f not in s]
+    return tier_a, tier_b
+
+
+def record_from_log(log_path: Path, base: Path, mode: str = "auto") -> Tuple[List[str], List[str]]:
+    if mode == "auto":
+        mode = detect_log_format(log_path)
+    if mode == "strace":
+        tier_a = parse_strace_log(log_path, base)
+    else:
+        tier_a = parse_inotify_log(log_path, base)
+    return _tier(tier_a, base)
+
+
+def record_inotify(
+    bundle: Path,
+    restore_cmd: List[str],
+    events: str = "open,access",
+    inotify_bin: str = "inotifywait",
+    settle: float = 1.0,
+    timeout: float = 300.0,
+    keep_log: Optional[Path] = None,
+    establish_timeout: float = 60.0,
+) -> Tuple[List[str], List[str]]:
+    log_ctx = tempfile.NamedTemporaryFile(prefix="sec_inotify_", suffix=".log", delete=False)
+    log_path = Path(keep_log) if keep_log else Path(log_ctx.name)
+    log_ctx.close()
+    err_ctx = tempfile.NamedTemporaryFile(prefix="sec_inotify_", suffix=".err", delete=False)
+    err_path = Path(err_ctx.name)
+    err_ctx.close()
+
+    cmd = [inotify_bin, "-m", "-r", "--timefmt", "%s",
+           "--format", "%T %w%f %e", "-e", events, str(bundle)]
+    with log_path.open("wb") as out, err_path.open("wb") as errf:
+        watcher = subprocess.Popen(cmd, stdout=out, stderr=errf)
+        try:
+            _await_watches(err_path, establish_timeout, settle)
+            try:
+                subprocess.run(restore_cmd, timeout=timeout)
+            except subprocess.TimeoutExpired:
+                pass
+            except FileNotFoundError:
+                raise RuntimeError("restore command not found: {}".format(restore_cmd[0]))
+            time.sleep(settle)
+        finally:
+            watcher.terminate()
+            try:
+                watcher.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                watcher.kill()
+
+    tier = record_from_log(log_path, Path(bundle), mode="inotify")
+    if not keep_log:
+        try:
+            log_path.unlink()
+        except OSError:
+            pass
+    try:
+        err_path.unlink()
+    except OSError:
+        pass
+    return tier
+
+
+def _await_watches(err_path: Path, establish_timeout: float, settle: float) -> None:
+    deadline = time.monotonic() + max(establish_timeout, settle)
+    while time.monotonic() < deadline:
+        try:
+            data = err_path.read_bytes()
+        except OSError:
+            data = b""
+        if b"established" in data.lower():
+            time.sleep(min(settle, 0.5))
+            return
+        time.sleep(0.2)
+    print("[satecode] warning: inotify watches not confirmed established within "
+          "{:.0f}s; access order may be incomplete".format(establish_timeout),
+          file=sys.stderr)
 
 
 def record_access_sequence(
     restore_cmd: List[str],
-    rootfs: Path,
+    base: Path,
     strace_bin: str = "strace",
+    timeout: float = 300.0,
 ) -> Tuple[List[str], List[str]]:
-    import tempfile as _tmp
-    with _tmp.TemporaryDirectory(prefix="sec_trace_") as td:
+    with tempfile.TemporaryDirectory(prefix="sec_trace_") as td:
         log = os.path.join(td, "acc.log")
-        cmd = [strace_bin, "-f", "-e", "trace=open,openat,execve", "-o", log, "--"] + restore_cmd
+        cmd = [strace_bin, "-f", "-e", "trace=open,openat,execve", "-o", log, "--"] + list(restore_cmd)
         try:
-            subprocess.run(cmd, timeout=300)
+            subprocess.run(cmd, timeout=timeout)
         except subprocess.TimeoutExpired:
             pass
         except FileNotFoundError:
             raise RuntimeError("strace not found: '{}'".format(strace_bin))
-        tier_a = _parse_access_log(Path(log), rootfs)
-
-    all_f  = _all_files(rootfs)
-    s      = set(tier_a)
-    tier_b = [f for f in all_f if f not in s]
-    return tier_a, tier_b
-
-
-def record_from_log(log_path: Path, rootfs: Path) -> Tuple[List[str], List[str]]:
-    tier_a = _parse_access_log(log_path, rootfs)
-    all_f  = _all_files(rootfs)
-    s      = set(tier_a)
-    tier_b = [f for f in all_f if f not in s]
-    return tier_a, tier_b
+        tier_a = parse_strace_log(Path(log), base)
+    return _tier(tier_a, base)

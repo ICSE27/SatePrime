@@ -36,6 +36,37 @@ def cmd_info(args: argparse.Namespace) -> int:
         print(str(e), file=sys.stderr); return 1
 
 
+def cmd_seed(args: argparse.Namespace) -> int:
+    from satecode.seed import SeedBuilder
+    try:
+        ep  = json.loads(args.entrypoint) if args.entrypoint else None
+        cmd = json.loads(args.cmd)        if args.cmd        else None
+        sb = SeedBuilder(
+            image=args.image,
+            output_dir=Path(args.output_dir),
+            seed_id=args.seed_id,
+            is_container=args.container,
+            entrypoint=ep,
+            cmd=cmd,
+            ready_timeout=args.ready_timeout,
+            checkpoint_args=(args.checkpoint_arg or []),
+            leave_running=args.leave_running,
+        )
+        r = sb.build()
+        print("bundle:    {}".format(r["bundle"]))
+        print("rootfs:    {}".format(r["rootfs"]))
+        print("snapshot:  {}".format(r["snapshot"]))
+        print("config:    {}".format(r["config"]))
+        return 0
+    except (TimeoutError, RuntimeError) as e:
+        print(str(e), file=sys.stderr); return 1
+    except Exception as e:
+        print(str(e), file=sys.stderr)
+        if args.verbose:
+            import traceback; traceback.print_exc()
+        return 1
+
+
 def cmd_snapshot(args: argparse.Namespace) -> int:
     from satecode.monitor import SnapshotCoordinator
     try:
@@ -47,10 +78,13 @@ def cmd_snapshot(args: argparse.Namespace) -> int:
             namespace=args.namespace,
             ready_timeout=args.ready_timeout,
             exec_timeout=args.exec_timeout,
+            resume_signal=args.resume_signal,
+            runc_bin=args.runc,
+            work_path=args.work_path,
         )
         r = sc.run(resume=not args.no_resume)
-        print("bundle: {}".format(r["bundle_path"]))
-        print("digest: {}".format(r["digest"]))
+        print("snapshot: {}".format(r["bundle_path"]))
+        print("digest:   {}".format(r["digest"]))
         if args.json:
             print(json.dumps({k: str(v) for k, v in r.items()}, indent=2))
         return 0
@@ -64,23 +98,33 @@ def cmd_snapshot(args: argparse.Namespace) -> int:
 
 
 def cmd_record(args: argparse.Namespace) -> int:
-    from satecode.monitor import record_access_sequence, record_from_log
+    from satecode.monitor import (record_inotify, record_access_sequence,
+                                  record_from_log)
     try:
-        rootfs = Path(args.rootfs)
+        base = Path(args.base)
         if args.log:
-            tier_a, tier_b = record_from_log(Path(args.log), rootfs)
+            tier_a, tier_b = record_from_log(Path(args.log), base, mode=args.mode)
+        elif args.tracer == "strace":
+            if not args.restore_cmd:
+                print("provide --restore-cmd (or --log)", file=sys.stderr); return 1
+            tier_a, tier_b = record_access_sequence(
+                args.restore_cmd, base, strace_bin=args.strace_bin, timeout=args.timeout)
         else:
             if not args.restore_cmd:
-                print("provide --restore-cmd or --log", file=sys.stderr); return 1
-            tier_a, tier_b = record_access_sequence(args.restore_cmd, rootfs,
-                                                    strace_bin=args.strace)
+                print("provide --restore-cmd (or --log)", file=sys.stderr); return 1
+            tier_a, tier_b = record_inotify(
+                base, args.restore_cmd, events=args.events,
+                inotify_bin=args.inotify_bin, timeout=args.timeout,
+                keep_log=(Path(args.keep_log) if args.keep_log else None))
+
         out = Path(args.output)
         out.parent.mkdir(parents=True, exist_ok=True)
         with out.open("w") as fh:
             for p in tier_a: fh.write(p + "\n")
             fh.write("---\n")
             for p in tier_b: fh.write(p + "\n")
-        print("tier_a: {}  tier_b: {}  -> {}".format(len(tier_a), len(tier_b), out))
+        print("tier_a (hot): {}  tier_b (cold): {}  -> {}".format(
+            len(tier_a), len(tier_b), out))
         return 0
     except Exception as e:
         print(str(e), file=sys.stderr)
@@ -96,27 +140,25 @@ def cmd_build(args: argparse.Namespace) -> int:
         tier_a, tier_b, section = [], [], 0
         for line in seq.read_text().splitlines():
             if line == "---": section = 1; continue
+            if not line: continue
             (tier_a if section == 0 else tier_b).append(line)
         aux = Path(args.aux_dir) if args.aux_dir else None
-        boundary = build_image(
-            image_tar=Path(args.image),
+        meta = build_image(
+            source=Path(args.source),
             output=Path(args.output),
             tier_a=tier_a, tier_b=tier_b,
             aux_dir=aux,
             mkfs_bin=args.mkfs_erofs,
+            sort=args.sort,
+            source_kind=args.source_kind,
         )
-        meta = {
-            "output": str(Path(args.output).resolve()),
-            "boundary": boundary,
-            "tier_a_count": len(tier_a),
-            "tier_b_count": len(tier_b),
-        }
-        meta_path = Path(args.output).with_suffix(".meta.json")
-        meta_path.write_text(json.dumps(meta, indent=2))
-        print("output:   {}".format(args.output))
-        print("meta:     {}".format(meta_path))
-        print("boundary: {}".format(boundary))
-        print("pass --meta {} to emit".format(meta_path))
+        print("output:     {}".format(meta["output"]))
+        print("meta:       {}".format(meta["meta_path"]))
+        print("boundary:   {} bytes  (erofs_size: {})".format(
+            meta["boundary"], meta["erofs_size"]))
+        print("tiers:      hot={} cold={}".format(
+            meta["tier_a_count"], meta["tier_b_count"]))
+        print("pass --meta {} to emit".format(meta["meta_path"]))
         return 0
     except Exception as e:
         print(str(e), file=sys.stderr)
@@ -148,15 +190,19 @@ def cmd_emit(args: argparse.Namespace) -> int:
         artifacts = emit(
             output_dir=Path(args.output_dir),
             image_path=image_path,
-            boundary=boundary,
+            boundary=int(boundary),
             arch=args.arch,
             compile_binary=not args.no_compile,
             exec_path=args.exec_path,
             runc=args.runc,
+            mnt=args.mnt,
+            upper=args.upper,
+            ovl_work=args.ovl_work,
             bundle=args.bundle,
             snap=args.snap,
             cid=args.cid,
-            work=args.work,
+            criu_work=args.work,
+            resume_signal=args.resume_signal,
         )
         for k, v in artifacts.items():
             print("{}: {}".format(k, v))
@@ -174,7 +220,7 @@ def create_parser() -> argparse.ArgumentParser:
     p.add_argument("-v", "--verbose", action="store_true")
     sub = p.add_subparsers(dest="command")
 
-    s = sub.add_parser("patch")
+    s = sub.add_parser("patch", help="inject the wrapper into an OCI/docker image tar")
     s.add_argument("-i", "--input",  required=True)
     s.add_argument("-o", "--output", required=True)
     s.add_argument("-d", "--dockerfile")
@@ -182,52 +228,88 @@ def create_parser() -> argparse.ArgumentParser:
     s.add_argument("-s", "--tag-suffix", default="-wrapped", dest="tag_suffix")
     s.set_defaults(func=cmd_patch)
 
-    s = sub.add_parser("info")
+    s = sub.add_parser("info", help="show entrypoint / patched status of an image tar")
     s.add_argument("-i", "--input", required=True)
     s.set_defaults(func=cmd_info)
 
-    s = sub.add_parser("snapshot")
+    s = sub.add_parser("seed", help="build a runc seed bundle and checkpoint it")
+    s.add_argument("image", help="docker image ref (or container id with --container)")
+    s.add_argument("-o", "--output-dir", required=True, dest="output_dir")
+    s.add_argument("--seed-id",       default="sat-seed", dest="seed_id")
+    s.add_argument("--container",     action="store_true",
+                   help="treat the positional arg as an existing container id")
+    s.add_argument("--entrypoint",    help="JSON array overriding the image entrypoint")
+    s.add_argument("--cmd",           help="JSON array overriding the image cmd")
+    s.add_argument("--ready-timeout", type=float, default=600.0, dest="ready_timeout")
+    s.add_argument("--checkpoint-arg", action="append", dest="checkpoint_arg",
+                   help="extra flag passed to `runc checkpoint` (repeatable)")
+    s.add_argument("--leave-running", action="store_true", dest="leave_running")
+    s.set_defaults(func=cmd_seed)
+
+    s = sub.add_parser("snapshot", help="checkpoint a running task at its ready point")
     s.add_argument("task_id")
     s.add_argument("-o", "--output-dir", required=True, dest="output_dir")
     s.add_argument("--token-path",    default="/tmp/checkpoint_ready", dest="token_path")
-    s.add_argument("--runtime",       default="ctr")
+    s.add_argument("--runtime",       default="runc",
+                   choices=["runc", "ctr", "docker"])
+    s.add_argument("--runc",          default="runc")
+    s.add_argument("--work-path",     default="/tmp/criu-work", dest="work_path")
     s.add_argument("--namespace",     default="default")
+    s.add_argument("--resume-signal", default="SIGUSR1", dest="resume_signal")
     s.add_argument("--ready-timeout", type=float, default=600.0, dest="ready_timeout")
     s.add_argument("--exec-timeout",  type=float, default=120.0, dest="exec_timeout")
     s.add_argument("--no-resume",     action="store_true", dest="no_resume")
     s.add_argument("--json",          action="store_true")
     s.set_defaults(func=cmd_snapshot)
 
-    s = sub.add_parser("record")
-    s.add_argument("--rootfs",      required=True)
-    s.add_argument("--restore-cmd", nargs=argparse.REMAINDER, dest="restore_cmd")
-    s.add_argument("--log")
+    s = sub.add_parser("record", help="profile file-access order during recovery")
+    s.add_argument("--base", required=True,
+                   help="dir the traced paths are relative to (bundle for inotify)")
+    s.add_argument("--tracer", default="inotify", choices=["inotify", "strace"])
+    s.add_argument("--restore-cmd", nargs=argparse.REMAINDER, dest="restore_cmd",
+                   help="command that replays recovery (e.g. runc restore ...)")
+    s.add_argument("--log", help="parse an existing trace log instead of tracing")
+    s.add_argument("--mode", default="auto", choices=["auto", "inotify", "strace"],
+                   help="format of --log")
+    s.add_argument("--events",     default="open,access")
+    s.add_argument("--inotify-bin", default="inotifywait", dest="inotify_bin")
+    s.add_argument("--strace-bin",  default="strace", dest="strace_bin")
+    s.add_argument("--keep-log",    dest="keep_log", help="save the raw trace log here")
+    s.add_argument("--timeout",     type=float, default=300.0)
     s.add_argument("-o", "--output", required=True)
-    s.add_argument("--strace",       default="strace")
     s.set_defaults(func=cmd_record)
 
-    s = sub.add_parser("build")
-    s.add_argument("-i", "--image",    required=True)
-    s.add_argument("-o", "--output",   required=True)
-    s.add_argument("-s", "--seq",      required=True)
+    s = sub.add_parser("build", help="synthesise a plain EROFS image + meta sidecar")
+    s.add_argument("-i", "--source",   required=True,
+                   help="seed bundle dir (default) or OCI image tar")
+    s.add_argument("--source-kind",    default="auto",
+                   choices=["auto", "bundle", "image"], dest="source_kind")
+    s.add_argument("-o", "--output",   required=True, help="output .erofs path")
+    s.add_argument("-s", "--seq",      required=True, help="access sequence from `record`")
     s.add_argument("-a", "--aux-dir",  dest="aux_dir")
+    s.add_argument("--sort",           default="none", help="mkfs.erofs --sort mode")
     s.add_argument("--mkfs-erofs",     default="mkfs.erofs", dest="mkfs_erofs")
     s.set_defaults(func=cmd_build)
 
-    s = sub.add_parser("emit")
+    s = sub.add_parser("emit", help="emit onboard prefetch + recovery launcher")
     s.add_argument("-o", "--output-dir", required=True, dest="output_dir")
-    s.add_argument("--image-path",       default=None,  dest="image_path")
+    s.add_argument("--image-path",       default=None,  dest="image_path",
+                   help="on-satellite path of the EROFS image")
     s.add_argument("--boundary",         type=int, default=None)
-    s.add_argument("--meta",             default=None)
+    s.add_argument("--meta",             default=None, help="build meta.json")
     s.add_argument("--arch", default="native",
                    choices=["native", "aarch64", "arm", "x86_64"])
     s.add_argument("--no-compile",  action="store_true", dest="no_compile")
     s.add_argument("--exec-path",   default="/usr/local/bin/sat_primer", dest="exec_path")
     s.add_argument("--runc",        default="/usr/bin/runc")
-    s.add_argument("--bundle",      default="/var/run/containers/bundle")
-    s.add_argument("--snap",        default="/var/run/containers/snap")
+    s.add_argument("--mnt",         default="/mnt/satecode/app")
+    s.add_argument("--upper",       default="/run/satecode/app/upper")
+    s.add_argument("--ovl-work",    default="/run/satecode/app/work", dest="ovl_work")
+    s.add_argument("--bundle",      default="/run/satecode/app/bundle")
+    s.add_argument("--snap",        default="snapshot")
     s.add_argument("--cid",         default="app")
-    s.add_argument("--work",        default="/tmp/runc-work")
+    s.add_argument("--work",        default="/tmp/criu-work")
+    s.add_argument("--resume-signal", default="SIGUSR1", dest="resume_signal")
     s.set_defaults(func=cmd_emit)
 
     return p

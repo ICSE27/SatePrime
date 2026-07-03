@@ -163,10 +163,6 @@ def _find_script(args: List[str]) -> Tuple[Optional[str], List[str], Optional[st
     i = 0
     while i < len(args):
         t = args[i]
-        if "python" in t or t.startswith("/usr") or t.startswith("/bin"):
-            i += 1; continue
-        if t in _PY_FLAGS:
-            i += 1; continue
         if t in ("-X", "-W"):
             i += 2; continue
         if t == "-c":
@@ -182,12 +178,18 @@ def _find_script(args: List[str]) -> Tuple[Optional[str], List[str], Optional[st
             except Exception:
                 pass
             return None, args[i+2:], None
+        if t in _PY_FLAGS:
+            i += 1; continue
         if t.endswith(".py"):
             return t, args[i+1:], None
+        base = os.path.basename(t)
+        if base.startswith("python") or base in ("env", "sh", "bash", "dash"):
+            i += 1; continue
         if os.path.isfile(t):
             try:
-                if "python" in open(t).readline():
-                    return t, args[i+1:], None
+                with open(t, "rb") as fh:
+                    if b"python" in fh.readline():
+                        return t, args[i+1:], None
             except OSError:
                 pass
         i += 1

@@ -9,53 +9,48 @@ _C_SRC = r"""
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 #include <unistd.h>
 
-#define _MAGIC    0x53415449u
-#define _HDR_SZ   32
-#define _BUF_SZ   (64 * 1024)
+#define _BUF_SZ (1024 * 1024)
 
 static unsigned char _buf[_BUF_SZ];
 
-static int _read_hdr(int fd, uint64_t *boundary, uint64_t *total) {
-    unsigned char h[_HDR_SZ];
-    if (read(fd, h, _HDR_SZ) != _HDR_SZ) return -1;
-    uint32_t m = ((uint32_t)h[0]<<24)|((uint32_t)h[1]<<16)|((uint32_t)h[2]<<8)|h[3];
-    if (m != _MAGIC) return -1;
-    uint64_t b = 0, t = 0;
-    for (int i = 0; i < 8; i++) b = (b<<8)|h[8+i];
-    for (int i = 0; i < 8; i++) t = (t<<8)|h[16+i];
-    *boundary = b; *total = t;
-    return 0;
-}
-
 int main(int argc, char *argv[]) {
-    if (argc < 2) return 1;
+    if (argc < 2) {
+        fprintf(stderr, "usage: %s <image> [bytes]\n", argv[0]);
+        return 1;
+    }
     int fd = open(argv[1], O_RDONLY);
     if (fd < 0) { perror("open"); return 1; }
-    uint64_t boundary = 0, total = 0;
-    if (_read_hdr(fd, &boundary, &total) != 0) {
-        fprintf(stderr, "bad header\n"); close(fd); return 1;
-    }
-    if (argc >= 3) boundary = (uint64_t)strtoull(argv[2], NULL, 10);
-    ssize_t n;
-    while (boundary > 0) {
-        size_t want = boundary < _BUF_SZ ? (size_t)boundary : _BUF_SZ;
-        n = read(fd, _buf, want);
+
+    uint64_t want = 0;
+    if (argc >= 3) want = (uint64_t)strtoull(argv[2], NULL, 10);
+
+#ifdef POSIX_FADV_WILLNEED
+    posix_fadvise(fd, 0, (off_t)want, POSIX_FADV_WILLNEED);
+#endif
+
+    uint64_t done = 0;
+    for (;;) {
+        size_t chunk = _BUF_SZ;
+        if (want && (want - done) < chunk) chunk = (size_t)(want - done);
+        if (want && chunk == 0) break;
+        ssize_t n = read(fd, _buf, chunk);
         if (n <= 0) break;
-        boundary -= (uint64_t)n;
+        done += (uint64_t)n;
     }
     close(fd);
     return 0;
 }
 """.lstrip()
 
-_UNIT_TMPL = """\
+
+_PRIMER_UNIT = """\
 [Unit]
+Description=stage warm
 DefaultDependencies=no
 After=local-fs.target
-Before=containerd.service docker.service {extra_before}
+Before=sat-app.service {extra_before}
 
 [Service]
 Type=oneshot
@@ -66,42 +61,165 @@ ExecStart={exec_path} {image_path} {boundary}
 WantedBy=sysinit.target
 """
 
+
+_APP_UNIT = """\
+[Unit]
+Description=stage app
+After=sat-primer.service local-fs.target
+Requires=sat-primer.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart={launch_path}
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+
 _LAUNCH_TMPL = Template(r"""#!/bin/sh
 set -u
 
 RUNC="$${RUNC:-$runc}"
+EROFS="$${EROFS:-$erofs}"
+MNT="$${MNT:-$mnt}"
+UPPER="$${UPPER:-$upper}"
+OVL_WORK="$${OVL_WORK:-$ovl_work}"
 BUNDLE="$${BUNDLE:-$bundle}"
 SNAP="$${SNAP:-$snap}"
 CID="$${CID:-$cid}"
-WORK="$${WORK:-$work}"
+CRIU_WORK="$${CRIU_WORK:-$criu_work}"
+BOUNDARY="$${BOUNDARY:-$boundary}"
+SIG="$${SIG:-$sig}"
+PRIMER="$${PRIMER:-$primer}"
+EROFSFUSE="$${EROFSFUSE:-erofsfuse}"
+DIAG="$${DIAG:-$$BUNDLE/diag}"
 
 _log() { echo "[launcher] $$*" >&2; }
 
-_warm() {
-    [ -d "$$SNAP" ] || { _log "snapshot dir missing: $$SNAP"; return 1; }
-    _log "attempting restore: $$CID"
-    "$$RUNC" restore \
-        --image-path "$$SNAP" \
-        --work-path "$$WORK" \
+_pre() {
+    [ -f "$$EROFS" ] || { _log "image missing: $$EROFS"; return 1; }
+    command -v "$$RUNC" >/dev/null 2>&1 || { _log "runc missing: $$RUNC"; return 1; }
+    return 0
+}
+
+_mount_image() {
+    mkdir -p "$$MNT"
+    if mountpoint -q "$$MNT" 2>/dev/null; then
+        :
+    elif mount -t erofs -o loop "$$EROFS" "$$MNT" 2>/dev/null; then
+        :
+    elif command -v "$$EROFSFUSE" >/dev/null 2>&1 && "$$EROFSFUSE" "$$EROFS" "$$MNT"; then
+        :
+    else
+        _log "cannot mount image (no kernel erofs and erofsfuse unavailable)"
+        return 1
+    fi
+    [ -d "$$MNT/rootfs" ] || { _log "no rootfs in image"; return 1; }
+    return 0
+}
+
+_prefetch() {
+    if [ -x "$$PRIMER" ]; then
+        "$$PRIMER" "$$EROFS" "$$BOUNDARY" || true
+    elif [ "$$BOUNDARY" -gt 0 ]; then
+        _kb=$$(( ($$BOUNDARY + 1023) / 1024 ))
+        dd if="$$EROFS" of=/dev/null bs=1024 count="$$_kb" 2>/dev/null || true
+    else
+        dd if="$$EROFS" of=/dev/null bs=1M 2>/dev/null || true
+    fi
+}
+
+_mount_overlay() {
+    mkdir -p "$$UPPER" "$$OVL_WORK" "$$BUNDLE/rootfs"
+    if ! mountpoint -q "$$BUNDLE/rootfs" 2>/dev/null; then
+        mount -t overlay overlay \
+            -o "lowerdir=$$MNT/rootfs,upperdir=$$UPPER,workdir=$$OVL_WORK" \
+            "$$BUNDLE/rootfs" || return 1
+    fi
+    return 0
+}
+
+_stage() {
+    cp -f "$$MNT/config.json" "$$BUNDLE/config.json" || return 1
+    ln -sfn "$$MNT/$$SNAP" "$$BUNDLE/$$SNAP"
+    return 0
+}
+
+_restore() {
+    mkdir -p "$$CRIU_WORK"
+    "$$RUNC" delete --force "$$CID" >/dev/null 2>&1 || true
+    "$$RUNC" restore --detach \
+        --image-path "$$BUNDLE/$$SNAP" \
+        --work-path "$$CRIU_WORK" \
         --bundle "$$BUNDLE" \
         "$$CID"
 }
 
+_resume() {
+    "$$RUNC" kill "$$CID" "$$SIG"
+}
+
+_observe() {
+    _st=$$("$$RUNC" state "$$CID" 2>/dev/null | tr -d ' \n')
+    case "$$_st" in
+        *\"status\":\"running\"*|*\"status\":\"created\"*|*\"status\":\"stopped\"*)
+            _log "post-check ok: $$CID" ;;
+        *) _log "post-check: state unavailable for $$CID" ;;
+    esac
+}
+
+_diag() {
+    mkdir -p "$$DIAG"
+    _f="$$DIAG/restore-fail.$$$$.txt"
+    {
+        echo "cid=$$CID stage=$${1:-?}"
+        "$$RUNC" state "$$CID" 2>&1
+        echo "--- criu restore.log (tail) ---"
+        tail -n 120 "$$CRIU_WORK/restore.log" 2>/dev/null
+        echo "--- dmesg (tail) ---"
+        dmesg 2>/dev/null | tail -n 40
+    } > "$$_f" 2>&1
+    _log "diagnostics -> $$_f"
+}
+
 _cold() {
-    _log "starting cold: $$CID"
+    _log "reverting to cold start: $$CID"
     "$$RUNC" delete --force "$$CID" >/dev/null 2>&1 || true
+    if [ -f "$$BUNDLE/config.json" ]; then
+        sed -i 's/"CHECKPOINT_ENABLED=1"/"CHECKPOINT_ENABLED=0"/' "$$BUNDLE/config.json" 2>/dev/null || true
+    fi
     "$$RUNC" run --bundle "$$BUNDLE" "$$CID"
 }
 
-if _warm; then
-    exit 0
+_pre            || { _cold; exit $$?; }
+_mount_image    || { _diag mount;   _cold; exit $$?; }
+_prefetch
+_mount_overlay  || { _diag overlay; _cold; exit $$?; }
+_stage          || { _diag stage;   _cold; exit $$?; }
+
+_restore; _restore_rc=$$?
+if [ "$$_restore_rc" -ne 0 ]; then
+    _log "restore failed (rc=$$_restore_rc)"
+    _diag "restore rc=$$_restore_rc"
+    _cold
+    exit $$?
 fi
 
-_rc=$$?
-_log "restore failed (rc=$$_rc), falling back"
-_cold
-exit $$?
+_resume; _resume_rc=$$?
+if [ "$$_resume_rc" -ne 0 ]; then
+    _log "resume failed (rc=$$_resume_rc)"
+    _diag "resume rc=$$_resume_rc"
+    _cold
+    exit $$?
+fi
+
+_observe
+_log "restored and resumed: $$CID"
+exit 0
 """)
+
 
 _CC_MAP = {
     "aarch64": "aarch64-linux-gnu-gcc",
@@ -115,22 +233,41 @@ def source() -> str:
     return _C_SRC
 
 
-def unit(image_path: str, boundary: int,
-         exec_path: str = "/usr/local/bin/sat_primer",
-         extra_before: str = "") -> str:
-    return _UNIT_TMPL.format(
+def primer_unit(image_path: str, boundary: int,
+                exec_path: str = "/usr/local/bin/sat_primer",
+                extra_before: str = "") -> str:
+    return _PRIMER_UNIT.format(
         image_path=image_path, boundary=boundary,
         exec_path=exec_path, extra_before=extra_before,
     )
 
 
+def app_unit(launch_path: str) -> str:
+    return _APP_UNIT.format(launch_path=launch_path)
+
+
+def unit(image_path: str, boundary: int,
+         exec_path: str = "/usr/local/bin/sat_primer",
+         extra_before: str = "") -> str:
+    return primer_unit(image_path, boundary, exec_path, extra_before)
+
+
 def launcher(runc: str = "/usr/bin/runc",
-             bundle: str = "/var/run/containers/bundle",
-             snap: str = "/var/run/containers/snap",
+             erofs: str = "/var/lib/satecode/app.erofs",
+             mnt: str = "/mnt/satecode/app",
+             upper: str = "/run/satecode/app/upper",
+             ovl_work: str = "/run/satecode/app/work",
+             bundle: str = "/run/satecode/app/bundle",
+             snap: str = "snapshot",
              cid: str = "app",
-             work: str = "/tmp/runc-work") -> str:
+             criu_work: str = "/tmp/criu-work",
+             boundary: int = 0,
+             sig: str = "SIGUSR1",
+             primer: str = "/usr/local/bin/sat_primer") -> str:
     return _LAUNCH_TMPL.substitute(
-        runc=runc, bundle=bundle, snap=snap, cid=cid, work=work,
+        runc=runc, erofs=erofs, mnt=mnt, upper=upper, ovl_work=ovl_work,
+        bundle=bundle, snap=snap, cid=cid, criu_work=criu_work,
+        boundary=boundary, sig=sig, primer=primer,
     )
 
 
@@ -153,10 +290,14 @@ def emit(output_dir: Path, image_path: str, boundary: int,
          arch: str = "native", compile_binary: bool = True,
          exec_path: str = "/usr/local/bin/sat_primer",
          runc: str = "/usr/bin/runc",
-         bundle: str = "/var/run/containers/bundle",
-         snap: str = "/var/run/containers/snap",
+         mnt: str = "/mnt/satecode/app",
+         upper: str = "/run/satecode/app/upper",
+         ovl_work: str = "/run/satecode/app/work",
+         bundle: str = "/run/satecode/app/bundle",
+         snap: str = "snapshot",
          cid: str = "app",
-         work: str = "/tmp/runc-work") -> dict:
+         criu_work: str = "/tmp/criu-work",
+         resume_signal: str = "SIGUSR1") -> dict:
     output_dir.mkdir(parents=True, exist_ok=True)
     out = {}
 
@@ -164,15 +305,22 @@ def emit(output_dir: Path, image_path: str, boundary: int,
     src_path.write_text(source())
     out["source"] = src_path
 
-    unit_path = output_dir / "sat-primer.service"
-    unit_path.write_text(unit(image_path, boundary, exec_path))
-    out["unit"] = unit_path
+    primer_unit_path = output_dir / "sat-primer.service"
+    primer_unit_path.write_text(primer_unit(image_path, boundary, exec_path))
+    out["primer_unit"] = primer_unit_path
 
     launch_path = output_dir / "launch.sh"
-    launch_path.write_text(launcher(runc=runc, bundle=bundle,
-                                    snap=snap, cid=cid, work=work))
+    launch_path.write_text(launcher(
+        runc=runc, erofs=image_path, mnt=mnt, upper=upper, ovl_work=ovl_work,
+        bundle=bundle, snap=snap, cid=cid, criu_work=criu_work,
+        boundary=boundary, sig=resume_signal, primer=exec_path,
+    ))
     launch_path.chmod(0o755)
     out["launcher"] = launch_path
+
+    app_unit_path = output_dir / "sat-app.service"
+    app_unit_path.write_text(app_unit(str(launch_path)))
+    out["app_unit"] = app_unit_path
 
     if compile_binary:
         bin_path = output_dir / "sat_primer"

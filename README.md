@@ -36,3 +36,45 @@ Other code
 ## Deployment
 
 - Assets related to a deployment case are provided under the `deployment/` directory.
+
+
+## Usage
+
+Each app under `apps/` builds into a runnable image from its own Dockerfile
+(e.g. `satprime/app3:latest`); that part is independent of everything below
+and isn't covered here. Install the package with `pip install -e .` to get
+the `satcode` / `python -m satecode` entry point the scripts call into.
+
+`env.sh` holds the settings the other four scripts share (`APP`, `IMG`, `LIB`,
+`WORK`, `MKFS`, `CID`, ...) and is sourced by each of them; the layout above
+is what the paths in `env.sh` assume, so any rename needs to be reflected
+there.
+
+### Running on the Ground
+
+Point `IMG` at an app image built above and run the ground-side stages in
+order — each picks up where the previous one left off under `$WORK`/`$LIB`
+and stops early if something's missing.
+
+```bash
+APP=app3 ./deployment/seed.sh
+./deployment/record.sh
+./deployment/build.sh
+```
+
+### Running on the Satellite
+
+```bash
+./deployment/emit.sh
+```
+
+This leaves the artifacts to hand off under `$LIB/out`. Copy that directory
+and the image from `build.sh` to the target host and run `launch.sh` there;
+the systemd units alongside it can be installed instead if you want it on
+the boot path.
+
+### Failure Handling
+
+`launch.sh` checks its own preconditions before and after each step. If
+restore doesn't come up cleanly it reverts to a cold start on its own and
+drops a note under `$BUNDLE/diag` — no separate step needed.

@@ -21,6 +21,8 @@ COPY requirements.txt ./
 
 RUN python -c "from pathlib import Path; p=Path('requirements.txt'); b=p.read_bytes(); t=b.decode('utf-16') if b[:2] in (b'\xff\xfe', b'\xfe\xff') else b.decode('utf-8'); p.write_text(t, encoding='utf-8')"
 
+RUN python -c "from pathlib import Path; p=Path('requirements.txt'); WIN_ONLY=('tensorflow-intel', 'pyreadline3'); lines=[l for l in p.read_text().splitlines() if l.split('==')[0].strip().lower() not in WIN_ONLY]; p.write_text('\n'.join(lines) + '\n')"
+
 RUN pip install --upgrade pip \
     && pip install -r requirements.txt
 
